@@ -58,7 +58,7 @@ def animate(i):
     ax2.set_xlabel('Time (seconds)')
     ax2.set_ylabel('Entropy (Randomness)')
     ax2.set_ylim(-0.1, 1.1)
-    ax2.axhline(y=0.5, color='orange', linestyle='--', label='Drop Threshold (0.5)')
+    ax2.axhline(y=0.3, color='orange', linestyle='--', label='Drop Threshold (0.3)')
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.3)
 

@@ -9,19 +9,19 @@ from mininet.log import setLogLevel, info
 class ProjectTopo( Topo ):
     """
     Custom Topology for SDN Anomaly Detection Project.
-    h1, h2: Normal users
+    h4, h2: Normal users
     h3: Attacker
-    h4: Victim Server
+    h1: Victim Server
     """
     def build( self ):
         # Add a single Open vSwitch
         s1 = self.addSwitch( 's1', cls=OVSKernelSwitch, protocols='OpenFlow13' )
 
         # Add hosts with static IPs and MACs for easier tracking during detection
-        h1 = self.addHost( 'h1', ip='10.0.0.1/24', mac='00:00:00:00:00:01' ) # Normal user
+        h1 = self.addHost( 'h1', ip='10.0.0.1/24', mac='00:00:00:00:00:01' ) # Victim Server
         h2 = self.addHost( 'h2', ip='10.0.0.2/24', mac='00:00:00:00:00:02' ) # Normal user
         h3 = self.addHost( 'h3', ip='10.0.0.3/24', mac='00:00:00:00:00:03' ) # Attacker
-        h4 = self.addHost( 'h4', ip='10.0.0.4/24', mac='00:00:00:00:00:04' ) # Victim
+        h4 = self.addHost( 'h4', ip='10.0.0.4/24', mac='00:00:00:00:00:04' ) # Normal user
 
         # Connect hosts to the switch
         self.addLink( h1, s1 )

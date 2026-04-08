@@ -1,4 +1,5 @@
 import math
+import statistics
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
@@ -10,17 +11,21 @@ import csv
 import time
 import os
 
-class AnomalyDetector(app_manager.RyuApp):
+class IPSController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
-        super(AnomalyDetector, self).__init__(*args, **kwargs)
+        super(IPSController, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.datapaths = {}
         
-        # ADDED: Dictionaries to store the previous polling cycle's packet counts
         self.prev_src_counts = {}
         self.prev_dst_counts = {}
+
+        # --- PHASE 2: ADAPTIVE THRESHOLD VARIABLES ---
+        self.history_rates = []  # Stores the last 10 flow rates
+        self.MIN_HISTORY_SAMPLES = 5 # Need at least 5 windows to calculate a baseline
+        self.blocked_macs = set() # Track who is currently timed out
 
         self.metrics_file = 'evaluation/metrics.csv'
         os.makedirs(os.path.dirname(self.metrics_file), exist_ok=True)
@@ -31,36 +36,20 @@ class AnomalyDetector(app_manager.RyuApp):
         self.monitor_thread = hub.spawn(self._monitor)
 
     def calculate_entropy(self, traffic_dict):
-        """ Calculates normalized Shannon entropy for a given set of traffic data. """
-        # Filter out negative or zero values just in case
         valid_counts = [count for count in traffic_dict.values() if count > 0]
         total_packets = sum(valid_counts)
-        
-        if total_packets == 0:
-            return 0.0
-        
-        entropy = 0.0
-        for count in valid_counts:
-            probability = count / total_packets
-            entropy -= probability * math.log2(probability)
-        
-        num_unique_elements = len(valid_counts)
-        if num_unique_elements > 1:
-            normalized_entropy = entropy / math.log2(num_unique_elements)
-        else:
-            normalized_entropy = 0.0
-            
-        return normalized_entropy
+        if total_packets == 0: return 0.0
+        entropy = sum([- (c / total_packets) * math.log2(c / total_packets) for c in valid_counts])
+        n = len(valid_counts)
+        return entropy / math.log2(n) if n > 1 else 0.0
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
-            if datapath.id not in self.datapaths:
-                self.datapaths[datapath.id] = datapath
+            if datapath.id not in self.datapaths: self.datapaths[datapath.id] = datapath
         elif ev.state == DEAD_DISPATCHER:
-            if datapath.id in self.datapaths:
-                del self.datapaths[datapath.id]
+            if datapath.id in self.datapaths: del self.datapaths[datapath.id]
 
     def _monitor(self):
         while True:
@@ -69,78 +58,109 @@ class AnomalyDetector(app_manager.RyuApp):
             hub.sleep(5)
 
     def _request_stats(self, datapath):
-        ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         req = parser.OFPFlowStatsRequest(datapath)
         datapath.send_msg(req)
+    
+    def unblock_mac(self, mac):
+        """Removes the MAC from the blocked list after the hardware timeout expires."""
+        if mac in self.blocked_macs:
+            self.blocked_macs.remove(mac)
+            self.logger.info("🔓 TIMEOUT EXPIRED: MAC %s has been unblocked by the controller.", mac)
 
+    # --- PHASE 2: MITIGATION ENGINE ---
+    def mitigate_attack(self, datapath, attacker_mac):
+        """Installs a high-priority drop rule with a 60-second timeout."""
+        if attacker_mac in self.blocked_macs:
+            return # Already blocked
+            
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        
+        # Match any traffic originating from the attacker's MAC
+        match = parser.OFPMatch(eth_src=attacker_mac)
+        
+        # Empty actions list means DROP
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_CLEAR_ACTIONS, [])]
+        
+        # Priority 100 overrides normal Priority 1 forwarding rules. 
+        # hard_timeout=60 means the switch will delete this rule after 60 seconds.
+        mod = parser.OFPFlowMod(
+            datapath=datapath, priority=100, match=match, 
+            instructions=inst, hard_timeout=60
+        )
+        datapath.send_msg(mod)
+        self.blocked_macs.add(attacker_mac)
+        self.logger.error("⚔️ MITIGATION DEPLOYED: Dropping all traffic from %s for 60 seconds.", attacker_mac)
+        
+        hub.spawn_after(60, self.unblock_mac, attacker_mac)
+    
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
         body = ev.msg.body
-        
+        datapath = ev.msg.datapath
         current_src_counts = {}
         current_dst_counts = {}
 
-        # Gather the CURRENT total packet counts
         for stat in [flow for flow in body if flow.priority == 1]:
-            src = stat.match.get('eth_src')
-            dst = stat.match.get('eth_dst')
-            packets = stat.packet_count
-            
-            if src:
-                current_src_counts[src] = current_src_counts.get(src, 0) + packets
-            if dst:
-                current_dst_counts[dst] = current_dst_counts.get(dst, 0) + packets
+            src, dst, pkts = stat.match.get('eth_src'), stat.match.get('eth_dst'), stat.packet_count
+            if src: current_src_counts[src] = current_src_counts.get(src, 0) + pkts
+            if dst: current_dst_counts[dst] = current_dst_counts.get(dst, 0) + pkts
 
-        # Calculate the DELTA (traffic strictly within the last 5 seconds)
-        window_src_counts = {}
-        for mac, count in current_src_counts.items():
-            prev_count = self.prev_src_counts.get(mac, 0)
-            window_src_counts[mac] = max(0, count - prev_count)
+        window_src_counts = {mac: max(0, count - self.prev_src_counts.get(mac, 0)) for mac, count in current_src_counts.items()}
+        window_dst_counts = {mac: max(0, count - self.prev_dst_counts.get(mac, 0)) for mac, count in current_dst_counts.items()}
 
-        window_dst_counts = {}
-        for mac, count in current_dst_counts.items():
-            prev_count = self.prev_dst_counts.get(mac, 0)
-            window_dst_counts[mac] = max(0, count - prev_count)
-
-        #  Save current totals for the next 5-second polling cycle
         self.prev_src_counts = current_src_counts
         self.prev_dst_counts = current_dst_counts
 
-        # Calculate Entropy using ONLY the 5-second window data
-        src_entropy = self.calculate_entropy(window_src_counts)
         dst_entropy = self.calculate_entropy(window_dst_counts)
-
-        self.logger.info("--- 5-Second Window Metrics ---")
-        self.logger.info("Source MAC Entropy: %.3f | Dest MAC Entropy: %.3f", src_entropy, dst_entropy)
-        self.logger.info("Total Packets in window: %d", sum(window_dst_counts.values()))
-
         flow_rate = sum(window_src_counts.values()) / 5.0
 
         with open(self.metrics_file, mode='a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([time.time(), flow_rate, dst_entropy])        
 
-        # Anomaly Detection & Heavy Hitter Identification
-        if sum(window_dst_counts.values()) > 50: 
-            if dst_entropy < 0.3:
+        self.logger.info("--- 5-Second Window Metrics ---")
+        self.logger.info("Current Flow Rate: %.2f pkts/sec | Dest Entropy: %.3f", flow_rate, dst_entropy)
+
+        is_anomaly = False
+
+        # --- PHASE 2: ADAPTIVE MATH (FIXED) ---
+        # 1. Evaluate using ONLY past baseline data
+        if len(self.history_rates) >= self.MIN_HISTORY_SAMPLES:
+            mean_rate = statistics.mean(self.history_rates)
+            std_dev = statistics.stdev(self.history_rates) if len(self.history_rates) > 1 else 0
+            
+            dynamic_threshold = max(50, mean_rate + (3 * std_dev))
+            self.logger.info("Dynamic Threshold: %.2f (Mean: %.2f, StdDev: %.2f)", dynamic_threshold, mean_rate, std_dev)
+
+            # 2. Check the Unified Rule
+            if flow_rate > dynamic_threshold and dst_entropy < 0.3:
+                is_anomaly = True
                 attacker_mac = max(window_src_counts, key=window_src_counts.get)
-                attack_volume = window_src_counts[attacker_mac]
-                victim_mac = max(window_dst_counts, key=window_dst_counts.get)
+                
+                self.logger.warning("🚨 ADAPTIVE ANOMALY DETECTED! Rate (%.2f) breached threshold (%.2f)", flow_rate, dynamic_threshold)
+                self.logger.warning("--> ATTACKER IDENTIFIED: %s", attacker_mac)
+                
+                # 3. Trigger Mitigation!
+                self.mitigate_attack(datapath, attacker_mac)
+        else:
+            self.logger.info("Gathering baseline... (%d/%d)", len(self.history_rates), self.MIN_HISTORY_SAMPLES)
 
-                self.logger.warning("!!! ALERT: ANOMALY DETECTED !!!")
-                self.logger.warning("Reason: Sudden drop in Destination Entropy (%.3f)", dst_entropy)
-                self.logger.warning("--> VICTIM IDENTIFIED: %s", victim_mac)
-                self.logger.warning("--> ATTACKER IDENTIFIED: %s (Window Volume: %d pkts)", attacker_mac, attack_volume)
+        # 4. Only add to history if it's NOT an attack (Prevent Baseline Poisoning)
+        if not is_anomaly:
+            self.history_rates.append(flow_rate)
+            if len(self.history_rates) > 10:
+                self.history_rates.pop(0)
+
         self.logger.info("-" * 32)
-
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        self.logger.info("--> Switch %s connected. Anomaly Detection Engine Online.", datapath.id)
+        self.logger.info("--> Switch %s connected. Phase 2 IPS Online.", datapath.id)
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
